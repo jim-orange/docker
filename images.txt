@@ -1,4 +1,4 @@
 golang:latest
 docker.io/zefhemel/silverbullet:latest
-openlistteam/openlist:latest
-easytier/easytier:latest
+docker.ermao.net/mlikiowa/napcat-docker:latest
+docker.ermao.net/ermaozi/tuilan_client
