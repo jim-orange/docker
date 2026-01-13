@@ -1,0 +1,389 @@
+name: 01. 批量同步 (Batch Sync)
+
+on:
+  push:
+    paths:
+      - "images.txt"
+  schedule:
+    - cron: "0 0 1,15 * *"
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: "强制同步 (跳过摘要比对)"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ALIYUN_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+  ALIYUN_NAMESPACE: ${{ secrets.ALIYUN_NAMESPACE }}
+  GHCR_REGISTRY: ghcr.io
+  WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+  # 映射 Secret 到 Env 以供 if 判断
+  DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  batch-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: 读取配置 & 检查 Secrets
+        id: config
+        run: |
+          # 读取 config.env (如果存在)
+          if [ -f "config.env" ]; then
+             source config.env
+             echo "CLEAN_DISK_SPACE=${CLEAN_DISK_SPACE}" >> $GITHUB_OUTPUT
+             echo "SYNC_MODE=${SYNC_MODE}" >> $GITHUB_ENV
+          else
+             echo "CLEAN_DISK_SPACE=true" >> $GITHUB_OUTPUT
+             echo "SYNC_MODE=none" >> $GITHUB_ENV
+          fi
+
+          if [ -z "${{ secrets.ALIYUN_USERNAME }}" ] || [ -z "${{ secrets.ALIYUN_PASSWORD }}" ]; then
+            echo "❌ 错误: 未配置 ALIYUN_USERNAME 或 ALIYUN_PASSWORD Secrets。"
+            exit 1
+          fi
+
+      - name: 🗑️ 清理磁盘空间
+        uses: easimon/maximize-build-space@master
+        if: steps.config.outputs.CLEAN_DISK_SPACE == 'true'
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 128
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          build-mount-path: "/var/lib/docker/"
+
+      - name: 重启 Docker 服务
+        run: sudo service docker restart
+
+      # Secrets check moved to previous step
+
+
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: 登录阿里云 ACR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 登录 DockerHub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: 📦 批量处理镜像
+        run: |
+          # 定义重试函数
+          # 定义重试函数
+          function retry {
+            local n=1
+            local max=3
+            local delay=5
+            while true; do
+              "$@" && break || {
+                if [[ $n -lt $max ]]; then
+                  ((n++))
+                  echo "⚠️ 命令失败，偿试第 $n/$max 次重试..." >&2
+                  sleep $delay;
+                else
+                  echo "❌ 命令在 $max 次尝试后失败。" >&2
+                  return 1
+                fi
+              }
+            done
+          }
+
+          if [ ! -s "images.txt" ]; then
+            echo "⚠️ images.txt 不存在或为空。"
+            exit 0
+          fi
+
+          echo "📋 开始批量处理..."
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            # 去除首尾空白
+            line=$(echo "$line" | xargs)
+            # 跳过空行和注释
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+            echo "----------------------------------------"
+            echo "🔄 处理指令: $line"
+
+            # 1. 提取镜像名和参数
+            # 策略: 移除所有以此开头参数 --xxxx=val 或 --xxxx val
+            # 但这比较复杂。简单策略: 
+            # 假设镜像名不以此 -- 开头。
+            # 我们可以遍历所有字段，找到那个不是参数的字段作为镜像名?
+            # 或者，更简单: 提取 --platform 部分，剩下的如果是 parameter flag 则忽略，否则就是 image
+            
+            # Use regex to extract platform value anywhere in string
+            PLATFORM_VAL=""
+            if [[ "$line" =~ --platform[=\ ]([^ ]+) ]]; then
+                 PLATFORM_VAL="${BASH_REMATCH[1]}"
+            fi
+            
+            # Construct Platform Arg
+            if [ -n "$PLATFORM_VAL" ]; then
+                 PLATFORM_ARG="--platform $PLATFORM_VAL"
+                 echo "⚙️  指定架构: $PLATFORM_VAL"
+                 if [[ "$PLATFORM_VAL" == *"/"* ]]; then
+                    SKOPEO_OS=$(echo "$PLATFORM_VAL" | cut -d'/' -f1)
+                    SKOPEO_ARCH=$(echo "$PLATFORM_VAL" | cut -d'/' -f2)
+                 else
+                    SKOPEO_ARCH="$PLATFORM_VAL"
+                 fi
+            fi
+            
+            SKOPEO_FLAGS="--override-os $SKOPEO_OS --override-arch $SKOPEO_ARCH"
+
+            # 提取镜像名: 移除 --platform=xxx 或 --platform xxx
+            # 这里的处理方式:
+            # 1. 移除 --platform=xxx
+            # 2. 移除 --platform xxx
+            # 3. Trim
+            
+            TEMP_LINE=$(echo "$line" | sed -E 's/--platform[= ]+[^ ]+ //g' | sed -E 's/ --platform[= ]+[^ ]+//g')
+            SRC_IMAGE=$(echo "$TEMP_LINE" | xargs)
+            
+            # 2. 命名处理 (Smart Naming)
+            # 提取 Scope (namespace) 和 Basename
+            # Logic: bitnami/redis -> Scope: bitnami, Base: redis
+            #        redis -> Scope: "", Base: redis
+            #        library/redis -> Scope: "", Base: redis
+            
+            SCOPE=""
+            BASE_NAME=$(basename "$SRC_IMAGE" | cut -d':' -f1)
+            TAG_NAME=$(echo "$SRC_IMAGE" | cut -d':' -f2 -s)
+            [ -z "$TAG_NAME" ] && TAG_NAME="latest"
+            
+            # 简单解析 namespace
+            if [[ "$SRC_IMAGE" == *"/"* ]]; then
+                NAMESPACE_PART=$(dirname "$SRC_IMAGE")
+                if [[ "$NAMESPACE_PART" != "library" && "$NAMESPACE_PART" != "." ]]; then
+                   SCOPE=$(basename "$NAMESPACE_PART")
+                fi
+            fi
+            
+            if [ -n "$SCOPE" ]; then
+               TARGET_TAG="${SCOPE}_${BASE_NAME}:${TAG_NAME}"
+            else
+               TARGET_TAG="${BASE_NAME}:${TAG_NAME}"
+            fi
+            
+            # 多架构前缀追加
+            if [ -n "$PLATFORM_VAL" ]; then
+               PLATFORM_PREFIX=$(echo "$PLATFORM_VAL" | sed 's/\//_/g')
+               TARGET_TAG="${PLATFORM_PREFIX}_${TARGET_TAG}"
+            fi
+
+            # 4. 读取配置与模式判定
+            # 使用之前 ENV 设置的 SYNC_MODE
+            MODE="${SYNC_MODE:-none}"
+            
+            echo "Current Sync Mode: $MODE"
+            
+            if [ "$MODE" == "none" ]; then
+                echo "🛑 同步模式为 none，跳过所有操作。"
+                continue
+            fi
+
+            ALI_TARGET="$ALIYUN_REGISTRY/$ALIYUN_NAMESPACE/$TARGET_TAG"
+            
+            # GHCR Target (Lowercase)
+            OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+            TAG_LOWER=$(echo "$TARGET_TAG" | tr '[:upper:]' '[:lower:]')
+            GHCR_TARGET="$GHCR_REGISTRY/$OWNER_LOWER/$TAG_LOWER"
+
+            # 5. 摘要比对 (三方)
+            FORCE="${{ inputs.force_sync }}"
+            PUSH_ALI=false
+            PUSH_GHCR=false
+            NEED_PULL=false
+            
+            # 初始化目标标记
+            CHECK_ALI=false
+            CHECK_GHCR=false
+            
+            case "$MODE" in
+                aliyun)
+                    CHECK_ALI=true
+                    ;;
+                ghcr)
+                    CHECK_GHCR=true
+                    ;;
+                double)
+                    CHECK_ALI=true
+                    CHECK_GHCR=true
+                    ;;
+                *)
+                    echo "⚠️ 未知模式 $MODE，默认跳过。"
+                    continue
+                    ;;
+            esac
+
+            if [ "$FORCE" != "true" ]; then
+               echo "🔍 比对 Digest & Created ($SKOPEO_ARCH) [Mode: $MODE]..."
+               
+               # 源信息
+               SRC_INFO=$(retry skopeo inspect $SKOPEO_FLAGS "docker://$SRC_IMAGE" --format='{{.Digest}}|{{.Created}}' 2>/dev/null || echo "")
+               SRC_DIGEST=$(echo "$SRC_INFO" | cut -d'|' -f1)
+               SRC_CREATED=$(echo "$SRC_INFO" | cut -d'|' -f2)
+               
+               if [ -z "$SRC_DIGEST" ]; then
+                   echo "⚠️ 无法获取源镜像信息，跳过。"
+                   continue
+               fi
+
+               # 1. Check Aliyun
+               if [ "$CHECK_ALI" == "true" ]; then
+                   ALI_INFO=$(retry skopeo inspect $SKOPEO_FLAGS "docker://$ALI_TARGET" --format='{{.Digest}}|{{.Created}}' 2>/dev/null || echo "")
+                   ALI_DIGEST=$(echo "$ALI_INFO" | cut -d'|' -f1)
+                   ALI_CREATED=$(echo "$ALI_INFO" | cut -d'|' -f2)
+                   
+                   if [ "$SRC_DIGEST" == "$ALI_DIGEST" ]; then
+                       echo "✅ [Aliyun] 摘要一致，跳过。"
+                   elif [ -n "$ALI_DIGEST" ] && [ "$SRC_CREATED" == "$ALI_CREATED" ]; then
+                       echo "⚠️ [Aliyun] 摘要不同但创建时间一致，判定为同源，跳过。"
+                   else
+                       echo "🚀 [Aliyun] 需更新"
+                       PUSH_ALI=true
+                   fi
+               fi
+
+               # 2. Check GHCR
+               if [ "$CHECK_GHCR" == "true" ]; then
+                   GHCR_INFO=$(retry skopeo inspect $SKOPEO_FLAGS "docker://$GHCR_TARGET" --format='{{.Digest}}|{{.Created}}' 2>/dev/null || echo "")
+                   GHCR_DIGEST=$(echo "$GHCR_INFO" | cut -d'|' -f1)
+                   GHCR_CREATED=$(echo "$GHCR_INFO" | cut -d'|' -f2)
+
+                   if [ "$SRC_DIGEST" == "$GHCR_DIGEST" ]; then
+                       echo "✅ [GHCR] 摘要一致，跳过。"
+                   elif [ -n "$GHCR_DIGEST" ] && [ "$SRC_CREATED" == "$GHCR_CREATED" ]; then
+                       echo "⚠️ [GHCR] 摘要不同但创建时间一致，判定为同源，跳过。"
+                   else
+                       echo "🚀 [GHCR] 需更新"
+                       PUSH_GHCR=true
+                   fi
+               fi
+            else
+               echo "⚠️ 强制模式，跳过比对。"
+               [ "$CHECK_ALI" == "true" ] && PUSH_ALI=true
+               [ "$CHECK_GHCR" == "true" ] && PUSH_GHCR=true
+            fi
+
+            # 汇总拉取需求
+            if [ "$PUSH_ALI" == "true" ] || [ "$PUSH_GHCR" == "true" ]; then
+                NEED_PULL=true
+            fi
+
+            # 6. 执行同步
+            if [ "$NEED_PULL" == "true" ]; then
+               echo "📥 拉取 $SRC_IMAGE ..."
+               retry docker pull $SRC_IMAGE $PLATFORM_ARG
+               
+               # 推送 Aliyun
+               if [ "$PUSH_ALI" == "true" ]; then
+                   echo "🏷️ -> 阿里云 $ALI_TARGET"
+                   docker tag "$SRC_IMAGE" "$ALI_TARGET"
+                   retry docker push "$ALI_TARGET"
+                   docker rmi "$ALI_TARGET" >/dev/null 2>&1 || true
+               fi
+               
+               # 推送 GHCR
+               if [ "$PUSH_GHCR" == "true" ]; then
+                   echo "🏷️ -> GHCR $GHCR_TARGET"
+                   docker tag "$SRC_IMAGE" "$GHCR_TARGET"
+                   retry docker push "$GHCR_TARGET"
+                   docker rmi "$GHCR_TARGET" >/dev/null 2>&1 || true
+               fi
+               
+               echo "🧹 清理源镜像..."
+               docker rmi "$SRC_IMAGE" >/dev/null 2>&1 || true
+            else
+               echo "💤 无需更新。"
+            fi
+            
+            # 简单监控
+            echo "磁盘空间:"
+            df -h | grep "/var/lib/docker" | awk '{print $4 " available"}' || true
+
+          done < images.txt
+
+      - name: 更新 README Badge
+        run: |
+          # 获取当前 UTC+8 时间
+          DATE=$(TZ='Asia/Shanghai' date +'%Y--%m--%d %H:%M:%S')
+          # URL Encode (space -> %20)
+          ENC_DATE=${DATE// /%20}
+
+          # 构造新的 badge 链接
+          NEW_BADGE="https://img.shields.io/badge/last%20sync-$ENC_DATE-green"
+
+          # 替换 README 中的 badge
+          # 匹配模式: ![Last Sync](https://img.shields.io/badge/.*)
+          sed -i "s|!\[Last Sync\](.*)|![Last Sync]($NEW_BADGE)|g" README.md
+
+          # 提交更改
+          if [[ -n $(git status -s) ]]; then
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git commit -am "docs: update last sync badge [skip ci]"
+            git push
+          else
+             echo "没有变更需要提交。"
+          fi
+
+      - name: 发送 Webhook 通知
+        if: always()
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "未配置 WEBHOOK_URL，跳过通知。"
+            exit 0
+          fi
+
+          JOB_STATUS="${{ job.status }}"
+          REPO_NAME="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$JOB_STATUS" == "success" ]; then
+             COLOR="info"
+             TITLE="✅ 批量同步成功"
+          else
+             COLOR="warning"
+             TITLE="❌ 批量同步失败"
+          fi
+
+          # 构造简单 JSON (适配常见的钉钉/飞书/Discord/Slack)
+          # 这里采用通用 JSON 结构，可视需要调整
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "msg_type": "text",
+            "content": {
+              "text": "$TITLE\n仓库: $REPO_NAME\n状态: $JOB_STATUS\n链接: $RUN_URL"
+            }
+          }
+          EOF
+          )
+
+          echo "发送通知..."
+          curl -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK_URL" || echo "发送失败"
